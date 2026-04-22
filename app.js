@@ -1,23 +1,8 @@
+//cancha_backend/app.js
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
-
-// 🎯 SOLO cargar dotenv si está disponible y estamos en desarrollo
-if (process.env.NODE_ENV !== 'production') {
-  try {
-    // Verificar si dotenv está instalado (solo en dev)
-    require.resolve('dotenv');
-    require('dotenv').config();
-    console.log('🔧 Modo desarrollo: dotenv configurado');
-  } catch (error) {
-    console.log('🔧 Dotenv no disponible, usando variables del sistema');
-  }
-} else {
-  console.log('🚀 Modo producción: usando variables de entorno de Render');
-}
-
-require('./services/expirationService');
-
+require('dotenv').config();
 require('./services/expirationService');
 
 const getIDRoutes = require('./api/getID');

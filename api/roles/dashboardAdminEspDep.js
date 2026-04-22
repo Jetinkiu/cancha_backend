@@ -17,13 +17,19 @@ const respuesta = (exito, mensaje, datos = null) => ({
 /**
  * 1. Resumen rápido (4 cards)
  */
-const obtenerResumen = async () => {
+const obtenerResumen = async (id_admin_esp_dep) => {
   const query = `
     WITH hoy AS (SELECT CURRENT_DATE AS fecha),
+    espacios_admin AS (
+      SELECT id_espacio 
+      FROM ESPACIO_DEPORTIVO 
+      WHERE id_admin_esp_dep = $1
+    ),
     canchas_activas AS (
       SELECT COUNT(*) AS total 
-      FROM CANCHA 
-      WHERE estado = 'disponible' OR estado = 'ocupada'
+      FROM CANCHA c
+      JOIN espacios_admin ea ON c.id_espacio = ea.id_espacio
+      WHERE c.estado = 'disponible' OR c.estado = 'ocupada'
     ),
     reservas_hoy AS (
       SELECT 
@@ -31,6 +37,9 @@ const obtenerResumen = async () => {
         COALESCE(SUM(r.monto_total), 0) AS ingresos
       FROM RESERVA r
       JOIN RESERVA_HORARIO rh ON r.id_reserva = rh.id_reserva
+      JOIN espacios_admin ea ON r.id_cancha IN (
+        SELECT id_cancha FROM CANCHA WHERE id_espacio = ea.id_espacio
+      )
       WHERE rh.fecha = (SELECT fecha FROM hoy) 
         AND r.estado != 'cancelada'
     ),
@@ -40,6 +49,7 @@ const obtenerResumen = async () => {
       ), 0) * (SELECT total FROM canchas_activas) AS total_horas
       FROM ESPACIO_DEPORTIVO e
       JOIN CANCHA c ON e.id_espacio = c.id_espacio
+      JOIN espacios_admin ea ON e.id_espacio = ea.id_espacio
       WHERE c.estado != 'mantenimiento'
     ),
     horas_reservadas AS (
@@ -48,6 +58,9 @@ const obtenerResumen = async () => {
       ), 0) AS horas
       FROM RESERVA_HORARIO rh
       JOIN RESERVA r ON rh.id_reserva = r.id_reserva
+      JOIN espacios_admin ea ON r.id_cancha IN (
+        SELECT id_cancha FROM CANCHA WHERE id_espacio = ea.id_espacio
+      )
       WHERE rh.fecha = (SELECT fecha FROM hoy) 
         AND r.estado != 'cancelada'
     )
@@ -64,14 +77,14 @@ const obtenerResumen = async () => {
         ELSE 0 
       END AS ocupacion_porcentaje;
   `;
-  const result = await pool.query(query);
+  const result = await pool.query(query, [id_admin_esp_dep]);
   return result.rows[0];
 };
 
 /**
  * 2. Últimas reservas (limit)
  */
-const obtenerUltimasReservas = async (limite = 3) => {
+const obtenerUltimasReservas = async (id_admin_esp_dep, limite = 3) => {
   const query = `
     SELECT 
       r.id_reserva,
@@ -83,34 +96,47 @@ const obtenerUltimasReservas = async (limite = 3) => {
     FROM RESERVA r
     JOIN RESERVA_HORARIO rh ON r.id_reserva = rh.id_reserva
     JOIN CANCHA c ON r.id_cancha = c.id_cancha
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
     JOIN se_practica sp ON c.id_cancha = sp.id_cancha
     JOIN DISCIPLINA d ON sp.id_disciplina = d.id_disciplina
     JOIN ANFITRION a ON r.id_anfitrion = a.id_anfitrion
     JOIN CLIENTE cl ON a.id_anfitrion = cl.id_cliente
     JOIN USUARIO u ON cl.id_cliente = u.id_persona
     WHERE r.estado != 'cancelada'
+      AND e.id_admin_esp_dep = $1
     ORDER BY rh.fecha DESC, rh.hora_inicio DESC
-    LIMIT $1;
+    LIMIT $2;
   `;
-  const result = await pool.query(query, [limite]);
+  const result = await pool.query(query, [id_admin_esp_dep, limite]);
   return result.rows;
 };
 
 /**
  * 3. Filtros rápidos (disciplinas)
  */
-const obtenerDisciplinas = async () => {
-  const query = `SELECT id_disciplina, nombre FROM DISCIPLINA ORDER BY nombre;`;
-  const result = await pool.query(query);
+const obtenerDisciplinas = async (id_admin_esp_dep) => {
+  const query = `
+    SELECT DISTINCT d.id_disciplina, d.nombre 
+    FROM DISCIPLINA d
+    JOIN se_practica sp ON d.id_disciplina = sp.id_disciplina
+    JOIN CANCHA c ON sp.id_cancha = c.id_cancha
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
+    WHERE e.id_admin_esp_dep = $1
+    ORDER BY d.nombre;
+  `;
+  const result = await pool.query(query, [id_admin_esp_dep]);
   return result.rows;
 };
 
 /**
  * 4. Matriz de disponibilidad
  */
-const obtenerMatrizDisponibilidad = async ({ fecha, hora_inicio, hora_fin, id_disciplina }) => {
-  const params = [fecha + ' ' + hora_inicio, fecha + ' ' + hora_fin, fecha];
+const obtenerMatrizDisponibilidad = async (id_admin_esp_dep, { fecha, hora_inicio, hora_fin, id_disciplina }) => {
+  const params = [id_admin_esp_dep, fecha + ' ' + hora_inicio, fecha + ' ' + hora_fin, fecha];
   let whereClause = '';
+  // CAMBIA esto: en lugar de "AND e.id_admin_esp_dep = $1" en el string
+  // Debería ser parte del WHERE
+  
   if (id_disciplina) {
     whereClause = `AND EXISTS (
       SELECT 1 FROM se_practica sp 
@@ -122,8 +148,8 @@ const obtenerMatrizDisponibilidad = async ({ fecha, hora_inicio, hora_fin, id_di
   const query = `
     WITH horarios AS (
       SELECT (generate_series(
-        $1::timestamp,
         $2::timestamp,
+        $3::timestamp,
         '1 hour'::interval
       ))::time AS hora
     ),
@@ -133,13 +159,15 @@ const obtenerMatrizDisponibilidad = async ({ fecha, hora_inicio, hora_fin, id_di
         e.horario_apertura, e.horario_cierre
       FROM CANCHA c
       JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
-      WHERE c.estado != 'mantenimiento' ${whereClause}
+      WHERE c.estado != 'mantenimiento' 
+        AND e.id_admin_esp_dep = $1
+        ${whereClause}
     ),
     reservas AS (
       SELECT rh.hora_inicio, rh.hora_fin, r.id_cancha
       FROM RESERVA_HORARIO rh
       JOIN RESERVA r ON rh.id_reserva = r.id_reserva
-      WHERE rh.fecha = $3 AND r.estado != 'cancelada'
+      WHERE rh.fecha = $4 AND r.estado != 'cancelada'
     )
     SELECT 
       cf.id_cancha, cf.espacio_nombre, cf.cancha_nombre,
@@ -162,13 +190,13 @@ const obtenerMatrizDisponibilidad = async ({ fecha, hora_inicio, hora_fin, id_di
 /**
  * 5. Canchas disponibles (horas libres)
  */
-const obtenerCanchasDisponibles = async ({ id_disciplina, fecha, hora_inicio, hora_fin }) => {
-  const params = [fecha + ' ' + hora_inicio, fecha + ' ' + hora_fin, id_disciplina, fecha];
+const obtenerCanchasDisponibles = async (id_admin_esp_dep, { id_disciplina, fecha, hora_inicio, hora_fin }) => {
+  const params = [id_admin_esp_dep, fecha + ' ' + hora_inicio, fecha + ' ' + hora_fin, id_disciplina, fecha];
   const query = `
     WITH horarios AS (
       SELECT (generate_series(
-        $1::timestamp,
         $2::timestamp,
+        $3::timestamp,
         '1 hour'::interval
       ))::time AS hora
     ),
@@ -178,13 +206,16 @@ const obtenerCanchasDisponibles = async ({ id_disciplina, fecha, hora_inicio, ho
       FROM CANCHA c
       JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
       JOIN se_practica sp ON c.id_cancha = sp.id_cancha
-      WHERE sp.id_disciplina = $3 AND c.estado != 'mantenimiento'
+      WHERE sp.id_disciplina = $4 
+        AND c.estado != 'mantenimiento'
+        AND e.id_admin_esp_dep = $1
     ),
     reservas AS (
       SELECT rh.hora_inicio, rh.hora_fin, r.id_cancha
       FROM RESERVA_HORARIO rh
       JOIN RESERVA r ON rh.id_reserva = r.id_reserva
-      WHERE rh.fecha = $4 AND r.estado != 'cancelada'
+      JOIN canchas_validas cv ON r.id_cancha = cv.id_cancha
+      WHERE rh.fecha = $5 AND r.estado != 'cancelada'
     ),
     disponibilidad AS (
       SELECT cv.id_cancha, cv.nombre AS cancha_nombre, cv.espacio_nombre, h.hora,
@@ -209,12 +240,12 @@ const obtenerCanchasDisponibles = async ({ id_disciplina, fecha, hora_inicio, ho
 /**
  * 6. Lista de reservas con paginación y filtros - VERSIÓN ROBUSTA
  */
-const obtenerReservas = async ({ estado, fecha, cliente, limit = 20, offset = 0 }) => {
+const obtenerReservas = async (id_admin_esp_dep, { estado, fecha, cliente, limit = 20, offset = 0 }) => {
   const limitNum = parseInt(limit) || 20;
   const offsetNum = parseInt(offset) || 0;
 
-  const conditions = [];
-  const params = [];
+  const conditions = [`e.id_admin_esp_dep = $${1}`];
+  const params = [id_admin_esp_dep];
   
   if (estado) {
     conditions.push(`r.estado = $${params.length + 1}`);
@@ -230,7 +261,7 @@ const obtenerReservas = async ({ estado, fecha, cliente, limit = 20, offset = 0 
     params.push(like);
   }
 
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
   params.push(limitNum, offsetNum);
 
@@ -250,6 +281,7 @@ const obtenerReservas = async ({ estado, fecha, cliente, limit = 20, offset = 0 
     JOIN CLIENTE cl ON a.id_anfitrion = cl.id_cliente
     JOIN USUARIO u ON cl.id_cliente = u.id_persona
     JOIN CANCHA c ON r.id_cancha = c.id_cancha
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
     ${whereClause}
     ORDER BY rh.fecha DESC, rh.hora_inicio DESC
     LIMIT $${params.length - 1} OFFSET $${params.length}
@@ -263,6 +295,7 @@ const obtenerReservas = async ({ estado, fecha, cliente, limit = 20, offset = 0 
     JOIN CLIENTE cl ON a.id_anfitrion = cl.id_cliente
     JOIN USUARIO u ON cl.id_cliente = u.id_persona
     JOIN CANCHA c ON r.id_cancha = c.id_cancha
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
     ${whereClause}
   `;
 
@@ -285,7 +318,7 @@ const obtenerReservas = async ({ estado, fecha, cliente, limit = 20, offset = 0 
 /**
  * 7. Detalle de reserva
  */
-const obtenerDetalleReserva = async (id) => {
+const obtenerDetalleReserva = async (id_admin_esp_dep, id_reserva) => {
   const query = `
     SELECT 
       r.*,
@@ -308,17 +341,17 @@ const obtenerDetalleReserva = async (id) => {
     JOIN USUARIO u ON cl.id_cliente = u.id_persona
     JOIN se_practica sp ON c.id_cancha = sp.id_cancha
     JOIN DISCIPLINA d ON sp.id_disciplina = d.id_disciplina
-    WHERE r.id_reserva = $1
+    WHERE r.id_reserva = $1 AND e.id_admin_esp_dep = $2
     LIMIT 1
   `;
-  const result = await pool.query(query, [id]);
+  const result = await pool.query(query, [id_reserva, id_admin_esp_dep]);
   return result.rows[0] || null;
 };
 
 /**
  * 8. Reporte: Reservas por disciplina
  */
-const obtenerReservasPorDisciplina = async (desde, hasta) => {
+const obtenerReservasPorDisciplina = async (id_admin_esp_dep, desde, hasta) => {
   const query = `
     SELECT 
       d.nombre AS disciplina,
@@ -326,53 +359,67 @@ const obtenerReservasPorDisciplina = async (desde, hasta) => {
       COALESCE(SUM(r.monto_total), 0) AS ingresos
     FROM RESERVA r
     JOIN CANCHA c ON r.id_cancha = c.id_cancha
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
     JOIN se_practica sp ON c.id_cancha = sp.id_cancha
     JOIN DISCIPLINA d ON sp.id_disciplina = d.id_disciplina
     JOIN RESERVA_HORARIO rh ON r.id_reserva = rh.id_reserva
     WHERE r.estado != 'cancelada'
-      AND rh.fecha BETWEEN $1 AND $2
+      AND e.id_admin_esp_dep = $1
+      AND rh.fecha BETWEEN $2 AND $3
     GROUP BY d.id_disciplina, d.nombre
     ORDER BY total_reservas DESC
   `;
-  const result = await pool.query(query, [desde, hasta]);
+  const result = await pool.query(query, [id_admin_esp_dep, desde, hasta]);
   return result.rows;
 };
 
 /**
  * 9. Reporte: Ingresos por día
  */
-const obtenerIngresos = async (desde, hasta) => {
+const obtenerIngresos = async (id_admin_esp_dep, desde, hasta) => {
   const query = `
     SELECT 
       rh.fecha,
       COALESCE(SUM(r.monto_total), 0) AS ingresos_dia
     FROM RESERVA r
     JOIN RESERVA_HORARIO rh ON r.id_reserva = rh.id_reserva
+    JOIN CANCHA c ON r.id_cancha = c.id_cancha
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
     WHERE r.estado != 'cancelada'
-      AND rh.fecha BETWEEN $1 AND $2
+      AND e.id_admin_esp_dep = $1
+      AND rh.fecha BETWEEN $2 AND $3
     GROUP BY rh.fecha
     ORDER BY rh.fecha
   `;
-  const result = await pool.query(query, [desde, hasta]);
+  const result = await pool.query(query, [id_admin_esp_dep, desde, hasta]);
   return result.rows;
 };
 
 /**
  * 10. Ocupación por hora
  */
-const obtenerOcupacionHoraria = async (fecha) => {
+const obtenerOcupacionHoraria = async (id_admin_esp_dep, fecha) => {
   const query = `
-    WITH horas AS (
+    WITH espacios_admin AS (
+      SELECT id_espacio 
+      FROM ESPACIO_DEPORTIVO 
+      WHERE id_admin_esp_dep = $1
+    ),
+    canchas_admin AS (
+      SELECT c.id_cancha 
+      FROM CANCHA c
+      JOIN espacios_admin ea ON c.id_espacio = ea.id_espacio
+      WHERE c.estado != 'mantenimiento'
+    ),
+    horas AS (
       SELECT (generate_series(
-        ($1::date || ' 08:00')::timestamp,
-        ($1::date || ' 22:00')::timestamp,
+        ($2::date || ' 08:00')::timestamp,
+        ($2::date || ' 22:00')::timestamp,
         '1 hour'::interval
       ))::time AS hora
     ),
-    total_canchas AS (
-      SELECT COUNT(*) AS total 
-      FROM CANCHA 
-      WHERE estado != 'mantenimiento'
+    total_canchas_admin AS (
+      SELECT COUNT(*) AS total FROM canchas_admin
     ),
     reservas_hora AS (
       SELECT 
@@ -380,15 +427,17 @@ const obtenerOcupacionHoraria = async (fecha) => {
         COUNT(*) AS reservas
       FROM RESERVA_HORARIO rh
       JOIN RESERVA r ON rh.id_reserva = r.id_reserva
-      WHERE rh.fecha = $1::date AND r.estado != 'cancelada'
+      WHERE rh.fecha = $2::date 
+        AND r.estado != 'cancelada'
+        AND r.id_cancha IN (SELECT id_cancha FROM canchas_admin)
       GROUP BY 1
     )
     SELECT 
       h.hora::text,
       COALESCE(rh.reservas, 0) AS reservas,
       CASE 
-        WHEN (SELECT total FROM total_canchas) > 0
-        THEN ROUND(COALESCE(rh.reservas, 0)::numeric / (SELECT total FROM total_canchas) * 100, 1)
+        WHEN (SELECT total FROM total_canchas_admin) > 0
+        THEN ROUND(COALESCE(rh.reservas, 0)::numeric / (SELECT total FROM total_canchas_admin) * 100, 1)
         ELSE 0
       END AS porcentaje
     FROM horas h
@@ -397,7 +446,7 @@ const obtenerOcupacionHoraria = async (fecha) => {
   `;
 
   try {
-    const result = await pool.query(query, [fecha]);
+    const result = await pool.query(query, [id_admin_esp_dep, fecha]);
     return result.rows;
   } catch (error) {
     console.error('Error en ocupacionHoraria:', error);
@@ -408,7 +457,7 @@ const obtenerOcupacionHoraria = async (fecha) => {
 /**
  * 11. Clientes frecuentes
  */
-const obtenerClientesFrecuentes = async () => {
+const obtenerClientesFrecuentes = async (id_admin_esp_dep) => {
   const query = `
     SELECT 
       (u.nombre || ' ' || u.apellido) AS cliente,
@@ -417,46 +466,58 @@ const obtenerClientesFrecuentes = async () => {
     JOIN ANFITRION a ON r.id_anfitrion = a.id_anfitrion
     JOIN CLIENTE cl ON a.id_anfitrion = cl.id_cliente
     JOIN USUARIO u ON cl.id_cliente = u.id_persona
+    JOIN CANCHA c ON r.id_cancha = c.id_cancha
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
     WHERE r.estado != 'cancelada'
+      AND e.id_admin_esp_dep = $1
     GROUP BY u.id_persona, u.nombre, u.apellido
     ORDER BY reservas DESC
     LIMIT 10
   `;
-  const result = await pool.query(query);
+  const result = await pool.query(query, [id_admin_esp_dep]);
   return result.rows;
 };
 
 /**
  * 12. Canchas más rentables
  */
-const obtenerCanchasRentables = async (limit = 5, offset = 0) => {
+const obtenerCanchasRentables = async (id_admin_esp_dep, limit = 5, offset = 0) => {
   const query = `
     SELECT 
       c.nombre,
       COUNT(r.id_reserva) AS reservas,
       COALESCE(SUM(r.monto_total), 0) AS ingresos
     FROM CANCHA c
+    JOIN ESPACIO_DEPORTIVO e ON c.id_espacio = e.id_espacio
     LEFT JOIN RESERVA r ON c.id_cancha = r.id_cancha AND r.estado != 'cancelada'
+    WHERE e.id_admin_esp_dep = $1
     GROUP BY c.id_cancha, c.nombre
     ORDER BY ingresos DESC
-    LIMIT $1 OFFSET $2
+    LIMIT $2 OFFSET $3
   `;
-  const result = await pool.query(query, [limit, offset]);
+  const result = await pool.query(query, [id_admin_esp_dep, limit, offset]);
   return result.rows;
 };
 
 /**
  * 13. Vista global (superadmin)
  */
-const obtenerVistaGlobal = async () => {
+const obtenerVistaGlobal = async (id_admin_esp_dep) => {
   const query = `
+    WITH espacios_admin AS (
+      SELECT id_espacio FROM ESPACIO_DEPORTIVO WHERE id_admin_esp_dep = $1
+    )
     SELECT 
-      (SELECT COUNT(*) FROM ESPACIO_DEPORTIVO) AS total_espacios,
-      (SELECT COUNT(*) FROM CANCHA WHERE estado != 'mantenimiento') AS total_canchas,
+      (SELECT COUNT(*) FROM espacios_admin) AS total_espacios,
+      (SELECT COUNT(*) FROM CANCHA c 
+       JOIN espacios_admin ea ON c.id_espacio = ea.id_espacio
+       WHERE c.estado != 'mantenimiento') AS total_canchas,
       (
-        SELECT COUNT(*) 
+        SELECT COUNT(DISTINCT r.id_reserva)
         FROM RESERVA_HORARIO rh
         JOIN RESERVA r ON rh.id_reserva = r.id_reserva
+        JOIN CANCHA c ON r.id_cancha = c.id_cancha
+        JOIN espacios_admin ea ON c.id_espacio = ea.id_espacio
         WHERE EXTRACT(MONTH FROM rh.fecha) = EXTRACT(MONTH FROM CURRENT_DATE)
           AND EXTRACT(YEAR FROM rh.fecha) = EXTRACT(YEAR FROM CURRENT_DATE)
           AND r.estado != 'cancelada'
@@ -465,12 +526,14 @@ const obtenerVistaGlobal = async () => {
         SELECT COALESCE(SUM(r.monto_total), 0)
         FROM RESERVA r
         JOIN RESERVA_HORARIO rh ON r.id_reserva = rh.id_reserva
+        JOIN CANCHA c ON r.id_cancha = c.id_cancha
+        JOIN espacios_admin ea ON c.id_espacio = ea.id_espacio
         WHERE EXTRACT(MONTH FROM rh.fecha) = EXTRACT(MONTH FROM CURRENT_DATE)
           AND EXTRACT(YEAR FROM rh.fecha) = EXTRACT(YEAR FROM CURRENT_DATE)
           AND r.estado != 'cancelada'
       ) AS ingresos_mes
   `;
-  const result = await pool.query(query);
+  const result = await pool.query(query, [id_admin_esp_dep]);
   return result.rows[0];
 };
 
@@ -478,9 +541,14 @@ const obtenerVistaGlobal = async () => {
 // CONTROLADORES
 // ===================================================================
 
+// ===================================================================
+// CONTROLADORES - MODIFICADOS
+// ===================================================================
+
 const resumenController = async (req, res) => {
   try {
-    const data = await obtenerResumen();
+    const { id_admin } = req.params;
+    const data = await obtenerResumen(id_admin);
     res.json(respuesta(true, 'Resumen rápido', { resumen: data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -489,8 +557,9 @@ const resumenController = async (req, res) => {
 
 const ultimasReservasController = async (req, res) => {
   try {
+    const { id_admin } = req.params;
     const limite = Math.min(parseInt(req.query.limit) || 3, 50);
-    const data = await obtenerUltimasReservas(limite);
+    const data = await obtenerUltimasReservas(id_admin, limite);
     res.json(respuesta(true, 'Últimas reservas', { reservas: data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -499,7 +568,8 @@ const ultimasReservasController = async (req, res) => {
 
 const disciplinasController = async (req, res) => {
   try {
-    const data = await obtenerDisciplinas();
+    const { id_admin } = req.params;
+    const data = await obtenerDisciplinas(id_admin);
     res.json(respuesta(true, 'Disciplinas', { disciplinas: data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -507,11 +577,12 @@ const disciplinasController = async (req, res) => {
 };
 
 const matrizController = async (req, res) => {
+  const { id_admin } = req.params;
   const { fecha, disciplina, hora_inicio = '08:00', hora_fin = '22:00' } = req.query;
   if (!fecha) return res.status(400).json(respuesta(false, 'Fecha requerida'));
 
   try {
-    const data = await obtenerMatrizDisponibilidad({
+    const data = await obtenerMatrizDisponibilidad(id_admin, {
       fecha,
       hora_inicio,
       hora_fin,
@@ -524,13 +595,14 @@ const matrizController = async (req, res) => {
 };
 
 const canchasDisponiblesController = async (req, res) => {
+  const { id_admin } = req.params;
   const { disciplina, fecha, hora_inicio = '08:00', hora_fin = '22:00' } = req.query;
   if (!disciplina || !fecha) {
     return res.status(400).json(respuesta(false, 'Faltan parámetros: disciplina y fecha'));
   }
 
   try {
-    const data = await obtenerCanchasDisponibles({
+    const data = await obtenerCanchasDisponibles(id_admin, {
       id_disciplina: parseInt(disciplina),
       fecha,
       hora_inicio,
@@ -543,9 +615,10 @@ const canchasDisponiblesController = async (req, res) => {
 };
 
 const reservasController = async (req, res) => {
+  const { id_admin } = req.params;
   const { estado, fecha, cliente, limit = 20, offset = 0 } = req.query;
   try {
-    const data = await obtenerReservas({
+    const data = await obtenerReservas(id_admin, {
       estado,
       fecha,
       cliente,
@@ -559,11 +632,11 @@ const reservasController = async (req, res) => {
 };
 
 const detalleReservaController = async (req, res) => {
-  const { id } = req.params;
+  const { id_admin, id } = req.params;
   if (!id || isNaN(id)) return res.status(400).json(respuesta(false, 'ID inválido'));
 
   try {
-    const data = await obtenerDetalleReserva(id);
+    const data = await obtenerDetalleReserva(id_admin, id);
     if (!data) return res.status(404).json(respuesta(false, 'Reserva no encontrada'));
     res.json(respuesta(true, 'Detalle de reserva', { reserva: data }));
   } catch (error) {
@@ -572,9 +645,14 @@ const detalleReservaController = async (req, res) => {
 };
 
 const reporteDisciplinaController = async (req, res) => {
+  const { id_admin } = req.params;
   const { desde, hasta } = req.query;
   try {
-    const data = await obtenerReservasPorDisciplina(desde || '2025-01-01', hasta || '2025-12-31');
+    const data = await obtenerReservasPorDisciplina(
+      id_admin, 
+      desde || '2025-01-01', 
+      hasta || '2025-12-31'
+    );
     res.json(respuesta(true, 'Reservas por disciplina', { data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -582,9 +660,14 @@ const reporteDisciplinaController = async (req, res) => {
 };
 
 const reporteIngresosController = async (req, res) => {
+  const { id_admin } = req.params;
   const { desde, hasta } = req.query;
   try {
-    const data = await obtenerIngresos(desde || '2025-01-01', hasta || '2025-12-31');
+    const data = await obtenerIngresos(
+      id_admin,
+      desde || '2025-01-01', 
+      hasta || '2025-12-31'
+    );
     res.json(respuesta(true, 'Ingresos por día', { data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -592,9 +675,13 @@ const reporteIngresosController = async (req, res) => {
 };
 
 const ocupacionHorariaController = async (req, res) => {
+  const { id_admin } = req.params;
   const { fecha } = req.query;
   try {
-    const data = await obtenerOcupacionHoraria(fecha || new Date().toISOString().split('T')[0]);
+    const data = await obtenerOcupacionHoraria(
+      id_admin,
+      fecha || new Date().toISOString().split('T')[0]
+    );
     res.json(respuesta(true, 'Ocupación por hora', { data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -603,7 +690,8 @@ const ocupacionHorariaController = async (req, res) => {
 
 const clientesFrecuentesController = async (req, res) => {
   try {
-    const data = await obtenerClientesFrecuentes();
+    const { id_admin } = req.params;
+    const data = await obtenerClientesFrecuentes(id_admin);
     res.json(respuesta(true, 'Clientes frecuentes', { data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -612,9 +700,10 @@ const clientesFrecuentesController = async (req, res) => {
 
 const canchasRentablesController = async (req, res) => {
   try {
+    const { id_admin } = req.params;
     const limit = parseInt(req.query.limit) || 5;
     const offset = parseInt(req.query.offset) || 0;
-    const data = await obtenerCanchasRentables(limit, offset);
+    const data = await obtenerCanchasRentables(id_admin, limit, offset);
     res.json(respuesta(true, 'Canchas rentables', { data, limit, offset }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -623,7 +712,8 @@ const canchasRentablesController = async (req, res) => {
 
 const vistaGlobalController = async (req, res) => {
   try {
-    const data = await obtenerVistaGlobal();
+    const { id_admin } = req.params;
+    const data = await obtenerVistaGlobal(id_admin);
     res.json(respuesta(true, 'Vista global', { global: data }));
   } catch (error) {
     res.status(500).json(respuesta(false, error.message));
@@ -634,18 +724,18 @@ const vistaGlobalController = async (req, res) => {
 // RUTAS
 // ===================================================================
 
-router.get('/resumen', resumenController);
-router.get('/ultimas-reservas', ultimasReservasController);
-router.get('/filtros/disciplinas', disciplinasController);
-router.get('/matriz-disponibilidad', matrizController);
-router.get('/canchas/disponibles', canchasDisponiblesController);
-router.get('/reservas', reservasController);
-router.get('/reservas/:id', detalleReservaController);
-router.get('/reportes/reservas-por-disciplina', reporteDisciplinaController);
-router.get('/reportes/ingresos', reporteIngresosController);
-router.get('/reportes/ocupacion-horaria', ocupacionHorariaController);
-router.get('/reportes/clientes-frecuentes', clientesFrecuentesController);
-router.get('/reportes/canchas-rentables', canchasRentablesController);
-router.get('/vista-global', vistaGlobalController);
+router.get('/resumen/:id_admin', resumenController);
+router.get('/ultimas-reservas/:id_admin', ultimasReservasController);
+router.get('/filtros/disciplinas/:id_admin', disciplinasController);
+router.get('/matriz-disponibilidad/:id_admin', matrizController);
+router.get('/canchas/disponibles/:id_admin', canchasDisponiblesController);
+router.get('/reservas/:id_admin', reservasController);
+router.get('/reservas//:id_admin', detalleReservaController);
+router.get('/reportes/reservas-por-disciplina/:id_admin', reporteDisciplinaController);
+router.get('/reportes/ingresos/:id_admin', reporteIngresosController);
+router.get('/reportes/ocupacion-horaria/:id_admin', ocupacionHorariaController);
+router.get('/reportes/clientes-frecuentes/:id_admin', clientesFrecuentesController);
+router.get('/reportes/canchas-rentables/:id_admin', canchasRentablesController);
+router.get('/vista-global/:id_admin', vistaGlobalController);
 
 module.exports = router;
